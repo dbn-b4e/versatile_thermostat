@@ -331,6 +331,7 @@ class UnderlyingSwitch(UnderlyingEntity):
             entity_id=switch_entity_id,
         )
         self._initial_delay_sec = initial_delay_sec
+        self._central_stagger_offset = 0
         self._async_cancel_cycle = None
         self._should_relaunch_control_heating = False
         self._on_time_sec = 0
@@ -356,8 +357,13 @@ class UnderlyingSwitch(UnderlyingEntity):
 
     @property
     def initial_delay_sec(self):
-        """The initial delay for this class"""
-        return self._initial_delay_sec
+        """The initial delay for this class, including central stagger offset"""
+        return self._initial_delay_sec + self._central_stagger_offset
+
+    def set_central_stagger_offset(self, offset_sec: int):
+        """Set the central scheduler stagger offset in seconds"""
+        self._central_stagger_offset = offset_sec
+        _LOGGER.debug("%s - Central stagger offset set to %d sec", self, offset_sec)
 
     @overrides
     @property
@@ -569,13 +575,13 @@ class UnderlyingSwitch(UnderlyingEntity):
         if should_be_on:
             # Set intended state before async scheduling to avoid race condition with keep_alive
             # by pass the initial delay but repsect the cycle is 100% powr is needed, so that maximum heating will be obtained immediately and not after the first cycle
-            if self._off_time_sec <= 0 and self._initial_delay_sec > 0:
+            if self._off_time_sec <= 0 and self.initial_delay_sec > 0:
                 _LOGGER.info("%s - 100%% power is requested -> start heating immediatly", self)
                 await self.turn_on()
 
-            # and starts the cycle with the initial delay
-            self._async_cancel_cycle = self.call_later(self._hass, self._initial_delay_sec, self._turn_on_later)
-            _LOGGER.debug("%s - Start cycle on_time=%d, initial_delay=%d)", self, self._on_time_sec, self._initial_delay_sec)
+            # and starts the cycle with the initial delay (includes central stagger offset)
+            self._async_cancel_cycle = self.call_later(self._hass, self.initial_delay_sec, self._turn_on_later)
+            _LOGGER.debug("%s - Start cycle on_time=%d, initial_delay=%d (stagger=%d))", self, self._on_time_sec, self.initial_delay_sec, self._central_stagger_offset)
         # if we not heat but device is active
         elif self.is_device_active:
             _LOGGER.info("%s - stop heating because device should be off and no cycle is active", self)

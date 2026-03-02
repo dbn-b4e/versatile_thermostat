@@ -186,6 +186,10 @@ class VersatileThermostatAPI:
         if not entry_id:
             await self.central_power_manager.start_listening()
             await self.central_boiler_manager.start_listening()
+            # Apply initial TPI cycle scheduling to stagger switch VTherms
+            if self.central_power_manager.is_configured:
+                self.central_power_manager.apply_cycle_schedule()
+                _LOGGER.info("Central TPI scheduler: initial stagger offsets applied")
 
     async def init_vtherm_preset_with_central(self):
         """Init all VTherm presets when the VTherm uses central temperature"""
