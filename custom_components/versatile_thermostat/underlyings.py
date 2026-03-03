@@ -579,6 +579,12 @@ class UnderlyingSwitch(UnderlyingEntity):
                 _LOGGER.info("%s - 100%% power is requested -> start heating immediatly", self)
                 await self.turn_on()
 
+            # Safety: when force-restarting with a stagger offset, turn OFF the device
+            # to avoid "carry-over" heating during the stagger wait period
+            if force and self.is_device_active and self._central_stagger_offset > 0:
+                _LOGGER.info("%s - Force restart with stagger %ds: turning OFF device to avoid carry-over", self, self._central_stagger_offset)
+                await self.turn_off()
+
             # and starts the cycle with the initial delay (includes central stagger offset)
             self._async_cancel_cycle = self.call_later(self._hass, self.initial_delay_sec, self._turn_on_later)
             _LOGGER.debug("%s - Start cycle on_time=%d, initial_delay=%d (stagger=%d))", self, self._on_time_sec, self.initial_delay_sec, self._central_stagger_offset)

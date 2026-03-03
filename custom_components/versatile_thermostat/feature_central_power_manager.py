@@ -1,6 +1,7 @@
 """ Implements a central Power Feature Manager for Versatile Thermostat """
 
 import logging
+import time
 
 from typing import Any
 from functools import cmp_to_key
@@ -304,40 +305,32 @@ class FeatureCentralPowerManager(BaseFeatureManager):
     def calculate_cycle_schedule(self) -> dict:
         """Calculate stagger offsets for all active over_switch VTherms.
 
-        Uses a bin-packing algorithm to distribute heating cycles across time
-        so that simultaneous power draw stays within available power limits.
+        Uses a shared clock so that offsets are deterministic regardless of
+        when start_cycle is called (boot, force=True, periodic timer).
 
-        Returns a dict {vtherm entity_id: start_delay_sec}.
+        Algorithm:
+        1. Collect active over_switch VTherms with on_percent > 0
+        2. Calculate power budget (central sensors or fallback)
+        3. Shed lowest on_percent VTherms if energy demand exceeds budget
+        4. Bin-pack remaining VTherms by power into time slots
+        5. Calculate desired_phase for each VTherm
+        6. Convert to offset relative to shared clock position
+
+        Returns a dict {vtherm entity_id: offset_sec}.
         """
         vtherms = self.find_all_over_switch_vtherms_active()
 
         if not vtherms:
             return {}
 
-        # If power management not configured, just return 0 offsets
-        if not self._is_configured or self._current_max_power is None or self._current_power is None:
-            _LOGGER.debug("CentralTpiScheduler: power not configured, returning zero offsets")
-            return {vt.entity_id: 0 for vt in vtherms}
-
-        # Calculate available power (max_power - current_power_excluding_heating)
-        heating_power = sum(
-            vt.power_manager.device_power
-            for vt in vtherms
-            if vt.is_device_active and vt.power_manager.is_configured
-        )
-        non_heating_power = max(0, (self._current_power or 0) - heating_power)
-        available_power = max(0, (self._current_max_power or 0) - non_heating_power)
-
-        if available_power <= 0:
-            _LOGGER.warning("CentralTpiScheduler: no power available (max=%.0f, non_heating=%.0f)",
-                          self._current_max_power or 0, non_heating_power)
-            return {vt.entity_id: 0 for vt in vtherms}
-
         # Get cycle duration (use minimum cycle_min across all vtherms)
         cycle_mins = [vt.cycle_min for vt in vtherms if vt.cycle_min > 0]
         if not cycle_mins:
-            return {vt.entity_id: 0 for vt in vtherms}
+            return {}
         cycle_sec = min(cycle_mins) * 60
+
+        # Shared clock: current position within the cycle
+        cycle_position = int(time.time()) % cycle_sec
 
         # Build list with power and on_percent info
         vtherm_infos = []
@@ -346,8 +339,8 @@ class FeatureCentralPowerManager(BaseFeatureManager):
             on_pct = vt.on_percent or 0
             on_time = on_pct * cycle_sec
             vtherm_infos.append({
-                "vtherm": vt,
                 "entity_id": vt.entity_id,
+                "vtherm": vt,
                 "device_power": device_power,
                 "on_percent": on_pct,
                 "on_time": on_time,
@@ -356,60 +349,154 @@ class FeatureCentralPowerManager(BaseFeatureManager):
         # Sort by on_percent descending (most demanding first)
         vtherm_infos.sort(key=lambda x: x["on_percent"], reverse=True)
 
-        # Bin-packing: group VTherms into time slots
+        # Calculate power budget
+        if self._is_configured and self._current_max_power is not None and self._current_power is not None:
+            total_heating_power = sum(info["device_power"] for info in vtherm_infos)
+            non_heating_power = max(0, (self._current_power or 0) - total_heating_power)
+            p_budget = max(0, (self._current_max_power or 0) - non_heating_power)
+            has_power_config = True
+        else:
+            p_budget = 0
+            has_power_config = False
+
+        # Energy demand check and shedding (only with power config)
+        if has_power_config and p_budget > 0:
+            energy_demand = sum(info["on_percent"] * info["device_power"] for info in vtherm_infos)
+
+            if energy_demand > p_budget:
+                _LOGGER.info(
+                    "CentralTpiScheduler: energy demand %.0fW > budget %.0fW, shedding lowest on_percent VTherms",
+                    energy_demand, p_budget,
+                )
+                # Shed from the lowest on_percent upward until demand fits
+                sorted_by_pct_asc = sorted(vtherm_infos, key=lambda x: x["on_percent"])
+                for info in sorted_by_pct_asc:
+                    if energy_demand <= p_budget:
+                        break
+                    energy_demand -= info["on_percent"] * info["device_power"]
+                    _LOGGER.info(
+                        "CentralTpiScheduler: shedding %s (on_pct=%.0f%%, power=%.0fW)",
+                        info["entity_id"], info["on_percent"] * 100, info["device_power"],
+                    )
+                    info["shed"] = True
+
+                # Remove shed VTherms from scheduling (they'll be handled by power manager)
+                vtherm_infos = [info for info in vtherm_infos if not info.get("shed")]
+
+        if not vtherm_infos:
+            return {}
+
+        # Single VTherm: no stagger needed
+        if len(vtherm_infos) == 1:
+            entity_id = vtherm_infos[0]["entity_id"]
+            _LOGGER.debug("CentralTpiScheduler: single VTherm %s, offset=0", entity_id)
+            return {entity_id: 0}
+
+        # Phase placement (bin-packing by power layers)
+        total_on_time = sum(info["on_time"] for info in vtherm_infos)
         schedule = {}
-        cursor = 0
-        slot_power = 0
-        slot_start = 0
-        slot_max_on_time = 0
 
-        for info in vtherm_infos:
-            dp = info["device_power"]
-            on_time = info["on_time"]
-
-            if slot_power + dp <= available_power:
-                slot_power += dp
-                slot_max_on_time = max(slot_max_on_time, on_time)
+        if not has_power_config:
+            # Fallback without power sensors
+            if total_on_time <= cycle_sec:
+                # Sequential: one ON at a time
+                cursor = 0
+                for info in vtherm_infos:
+                    desired_phase = int(cursor)
+                    offset = (desired_phase - cycle_position) % cycle_sec
+                    schedule[info["entity_id"]] = offset
+                    cursor += info["on_time"]
+                _LOGGER.info(
+                    "CentralTpiScheduler: SEQUENTIAL (no power config) %d VTherms, "
+                    "cycle_pos=%ds, offsets=%s",
+                    len(schedule), cycle_position,
+                    {k: f"{v}s" for k, v in schedule.items()},
+                )
             else:
-                cursor = slot_start + slot_max_on_time
-                slot_start = cursor
-                slot_power = dp
-                slot_max_on_time = on_time
+                # Uniform distribution
+                n = len(vtherm_infos)
+                for i, info in enumerate(vtherm_infos):
+                    desired_phase = int(i * cycle_sec / n)
+                    offset = (desired_phase - cycle_position) % cycle_sec
+                    schedule[info["entity_id"]] = offset
+                _LOGGER.info(
+                    "CentralTpiScheduler: UNIFORM (no power config) %d VTherms, "
+                    "cycle_pos=%ds, offsets=%s",
+                    len(schedule), cycle_position,
+                    {k: f"{v}s" for k, v in schedule.items()},
+                )
+        else:
+            # Bin-packing with power budget
+            if p_budget <= 0:
+                p_budget = sum(info["device_power"] for info in vtherm_infos)
 
-            schedule[info["entity_id"]] = int(slot_start)
+            cursor = 0
+            slot_power = 0
+            slot_start = 0
+            slot_max_on_time = 0
 
-        _LOGGER.info(
-            "CentralTpiScheduler: scheduled %d VTherms, available_power=%.0fW, cycle=%ds, offsets=%s",
-            len(schedule),
-            available_power,
-            cycle_sec,
-            {k: f"{v}s" for k, v in schedule.items()},
-        )
+            for info in vtherm_infos:
+                dp = info["device_power"]
+                on_time = info["on_time"]
 
-        total_end = cursor + slot_max_on_time
-        if total_end > cycle_sec:
-            _LOGGER.warning(
-                "CentralTpiScheduler: schedule overflows cycle by %.0fs. "
-                "Power manager will handle overflow in real-time.",
-                total_end - cycle_sec,
+                if slot_power > 0 and slot_power + dp <= p_budget:
+                    # Fits in current slot (parallel)
+                    slot_power += dp
+                    slot_max_on_time = max(slot_max_on_time, on_time)
+                else:
+                    # New slot
+                    if slot_power > 0:
+                        cursor = slot_start + slot_max_on_time
+                    slot_start = cursor
+                    slot_power = dp
+                    slot_max_on_time = on_time
+
+                desired_phase = int(slot_start)
+                offset = (desired_phase - cycle_position) % cycle_sec
+                schedule[info["entity_id"]] = offset
+
+            _LOGGER.info(
+                "CentralTpiScheduler: BIN-PACK %d VTherms, budget=%.0fW, "
+                "cycle_pos=%ds, offsets=%s",
+                len(schedule), p_budget, cycle_position,
+                {k: f"{v}s" for k, v in schedule.items()},
             )
+
+            total_end = cursor + slot_max_on_time
+            if total_end > cycle_sec:
+                _LOGGER.warning(
+                    "CentralTpiScheduler: schedule overflows cycle by %.0fs. "
+                    "Power manager will handle overflow in real-time.",
+                    total_end - cycle_sec,
+                )
 
         return schedule
 
     def apply_cycle_schedule(self):
-        """Calculate and apply stagger offsets to all active over_switch VTherms."""
-        schedule = self.calculate_cycle_schedule()
-        if not schedule:
-            return
+        """Calculate and apply stagger offsets to all active over_switch VTherms.
+        Does NOT force-restart — the calling start_cycle handles that."""
+        try:
+            schedule = self.calculate_cycle_schedule()
+            if not schedule:
+                # Reset all offsets to 0 when no schedule applies
+                vtherms = self.find_all_over_switch_vtherms_active()
+                for vt in vtherms:
+                    for under in vt.underlyings:
+                        if hasattr(under, 'set_central_stagger_offset'):
+                            under.set_central_stagger_offset(0)
+                return
 
-        for entity_id, offset_sec in schedule.items():
             vtherms = self.find_all_over_switch_vtherms_active()
-            for vt in vtherms:
-                if vt.entity_id == entity_id:
+            vtherm_by_id = {vt.entity_id: vt for vt in vtherms}
+
+            for entity_id, offset_sec in schedule.items():
+                vt = vtherm_by_id.get(entity_id)
+                if vt:
                     for under in vt.underlyings:
                         if hasattr(under, 'set_central_stagger_offset'):
                             under.set_central_stagger_offset(offset_sec)
-                    break
+        except Exception as e:
+            _LOGGER.error("CentralTpiScheduler: error applying schedule: %s. Heating unaffected.", e)
 
     def add_started_vtherm_total_power(self, started_power: float):
         """Add the power into the _started_vtherm_total_power which holds all VTherm started after

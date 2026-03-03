@@ -367,9 +367,12 @@ class TPIHandler:
             t._off_time_sec = off_time_sec
 
             # Notify central TPI scheduler to recalculate stagger offsets
-            api = VersatileThermostatAPI.get_vtherm_api()
-            if api and api.central_power_manager and api.central_power_manager.is_configured:
-                api.central_power_manager.apply_cycle_schedule()
+            try:
+                api = VersatileThermostatAPI.get_vtherm_api()
+                if api and api.central_power_manager:
+                    api.central_power_manager.apply_cycle_schedule()
+            except Exception as e:
+                _LOGGER.error("CentralTpiScheduler hook error: %s. Heating unaffected.", e)
 
             for under in t.underlyings:
                 await under.start_cycle(
