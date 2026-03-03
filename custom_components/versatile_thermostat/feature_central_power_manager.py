@@ -430,30 +430,77 @@ class FeatureCentralPowerManager(BaseFeatureManager):
             if p_budget <= 0:
                 p_budget = sum(info["device_power"] for info in vtherm_infos)
 
-            cursor = 0
+            # Group VTherms into power slots (items that can run in parallel)
+            slots = []  # list of lists of infos
+            current_slot = []
             slot_power = 0
-            slot_start = 0
-            slot_max_on_time = 0
 
             for info in vtherm_infos:
                 dp = info["device_power"]
-                on_time = info["on_time"]
-
                 if slot_power > 0 and slot_power + dp <= p_budget:
                     # Fits in current slot (parallel)
+                    current_slot.append(info)
                     slot_power += dp
-                    slot_max_on_time = max(slot_max_on_time, on_time)
                 else:
                     # New slot
-                    if slot_power > 0:
-                        cursor = slot_start + slot_max_on_time
-                    slot_start = cursor
+                    if current_slot:
+                        slots.append(current_slot)
+                    current_slot = [info]
                     slot_power = dp
-                    slot_max_on_time = on_time
 
-                desired_phase = int(slot_start)
-                offset = (desired_phase - cycle_position) % cycle_sec
-                schedule[info["entity_id"]] = offset
+            if current_slot:
+                slots.append(current_slot)
+
+            # Assign phases within each slot using dual-end spreading
+            # to minimize temporal overlap when total on_time > cycle_sec
+            #
+            # Within a power slot, VTherms CAN run simultaneously (power fits).
+            # But we WANT to minimize temporal overlap to smooth the power curve.
+            # Strategy: first item starts at slot_start, last item ends at
+            # slot_start + cycle_sec (wrapping), so overlap is minimized to
+            # the incompressible: sum(on_times) - cycle_sec.
+            cursor = 0
+            for slot_idx, slot in enumerate(slots):
+                slot_max_on_time = max(info["on_time"] for info in slot)
+
+                if len(slot) == 1:
+                    # Single item in slot
+                    desired_phase = int(cursor)
+                    offset = (desired_phase - cycle_position) % cycle_sec
+                    schedule[slot[0]["entity_id"]] = offset
+                else:
+                    # Multiple items sharing a power slot
+                    # Sort by on_time descending within the slot
+                    slot_sorted = sorted(slot, key=lambda x: x["on_time"], reverse=True)
+                    slot_total_on = sum(info["on_time"] for info in slot_sorted)
+
+                    if slot_total_on <= cycle_sec:
+                        # All fit sequentially within one cycle — no overlap needed
+                        sub_cursor = cursor
+                        for info in slot_sorted:
+                            desired_phase = int(sub_cursor)
+                            offset = (desired_phase - cycle_position) % cycle_sec
+                            schedule[info["entity_id"]] = offset
+                            sub_cursor += info["on_time"]
+                    else:
+                        # Overlap is unavoidable. Spread from both ends to minimize it.
+                        # First item starts at cursor, second item ends at cursor + cycle_sec
+                        # Overlap = slot_total_on - cycle_sec (incompressible minimum)
+                        front_cursor = cursor
+                        back_cursor = cursor + cycle_sec  # virtual end of cycle window
+                        for i, info in enumerate(slot_sorted):
+                            if i % 2 == 0:
+                                # Pack from start
+                                desired_phase = int(front_cursor) % cycle_sec
+                                front_cursor += info["on_time"]
+                            else:
+                                # Pack from end
+                                back_cursor -= info["on_time"]
+                                desired_phase = int(back_cursor) % cycle_sec
+                            offset = (desired_phase - cycle_position) % cycle_sec
+                            schedule[info["entity_id"]] = offset
+
+                cursor += slot_max_on_time
 
             _LOGGER.info(
                 "CentralTpiScheduler: BIN-PACK %d VTherms, budget=%.0fW, "
@@ -462,12 +509,11 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                 {k: f"{v}s" for k, v in schedule.items()},
             )
 
-            total_end = cursor + slot_max_on_time
-            if total_end > cycle_sec:
+            if cursor > cycle_sec:
                 _LOGGER.warning(
                     "CentralTpiScheduler: schedule overflows cycle by %.0fs. "
                     "Power manager will handle overflow in real-time.",
-                    total_end - cycle_sec,
+                    cursor - cycle_sec,
                 )
 
         return schedule
