@@ -316,7 +316,7 @@ class FeatureCentralPowerManager(BaseFeatureManager):
         5. Calculate desired_phase for each VTherm
         6. Convert to offset relative to shared clock position
 
-        Returns a dict {vtherm entity_id: offset_sec}.
+        Returns a dict {vtherm entity_id: desired_phase_sec}.
         """
         vtherms = self.find_all_over_switch_vtherms_active()
 
@@ -386,10 +386,10 @@ class FeatureCentralPowerManager(BaseFeatureManager):
         if not vtherm_infos:
             return {}
 
-        # Single VTherm: no stagger needed
+        # Single VTherm: no stagger needed, phase=0
         if len(vtherm_infos) == 1:
             entity_id = vtherm_infos[0]["entity_id"]
-            _LOGGER.debug("CentralTpiScheduler: single VTherm %s, offset=0", entity_id)
+            _LOGGER.debug("CentralTpiScheduler: single VTherm %s, phase=0", entity_id)
             return {entity_id: 0}
 
         # Phase placement (bin-packing by power layers)
@@ -403,12 +403,11 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                 cursor = 0
                 for info in vtherm_infos:
                     desired_phase = int(cursor)
-                    offset = (desired_phase - cycle_position) % cycle_sec
-                    schedule[info["entity_id"]] = offset
+                    schedule[info["entity_id"]] = desired_phase
                     cursor += info["on_time"]
                 _LOGGER.info(
                     "CentralTpiScheduler: SEQUENTIAL (no power config) %d VTherms, "
-                    "cycle_pos=%ds, offsets=%s",
+                    "cycle_pos=%ds, phases=%s",
                     len(schedule), cycle_position,
                     {k: f"{v}s" for k, v in schedule.items()},
                 )
@@ -417,11 +416,10 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                 n = len(vtherm_infos)
                 for i, info in enumerate(vtherm_infos):
                     desired_phase = int(i * cycle_sec / n)
-                    offset = (desired_phase - cycle_position) % cycle_sec
-                    schedule[info["entity_id"]] = offset
+                    schedule[info["entity_id"]] = desired_phase
                 _LOGGER.info(
                     "CentralTpiScheduler: UNIFORM (no power config) %d VTherms, "
-                    "cycle_pos=%ds, offsets=%s",
+                    "cycle_pos=%ds, phases=%s",
                     len(schedule), cycle_position,
                     {k: f"{v}s" for k, v in schedule.items()},
                 )
@@ -466,8 +464,7 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                 if len(slot) == 1:
                     # Single item in slot
                     desired_phase = int(cursor)
-                    offset = (desired_phase - cycle_position) % cycle_sec
-                    schedule[slot[0]["entity_id"]] = offset
+                    schedule[slot[0]["entity_id"]] = desired_phase
                 else:
                     # Multiple items sharing a power slot
                     # Sort by on_time descending within the slot
@@ -479,8 +476,7 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                         sub_cursor = cursor
                         for info in slot_sorted:
                             desired_phase = int(sub_cursor)
-                            offset = (desired_phase - cycle_position) % cycle_sec
-                            schedule[info["entity_id"]] = offset
+                            schedule[info["entity_id"]] = desired_phase
                             sub_cursor += info["on_time"]
                     else:
                         # Overlap is unavoidable. Spread from both ends to minimize it.
@@ -497,14 +493,13 @@ class FeatureCentralPowerManager(BaseFeatureManager):
                                 # Pack from end
                                 back_cursor -= info["on_time"]
                                 desired_phase = int(back_cursor) % cycle_sec
-                            offset = (desired_phase - cycle_position) % cycle_sec
-                            schedule[info["entity_id"]] = offset
+                            schedule[info["entity_id"]] = desired_phase
 
                 cursor += slot_max_on_time
 
             _LOGGER.info(
                 "CentralTpiScheduler: BIN-PACK %d VTherms, budget=%.0fW, "
-                "cycle_pos=%ds, offsets=%s",
+                "cycle_pos=%ds, phases=%s",
                 len(schedule), p_budget, cycle_position,
                 {k: f"{v}s" for k, v in schedule.items()},
             )
@@ -519,28 +514,28 @@ class FeatureCentralPowerManager(BaseFeatureManager):
         return schedule
 
     def apply_cycle_schedule(self):
-        """Calculate and apply stagger offsets to all active over_switch VTherms.
+        """Calculate and apply desired TPI phases to all active over_switch VTherms.
         Does NOT force-restart — the calling start_cycle handles that."""
         try:
             schedule = self.calculate_cycle_schedule()
             if not schedule:
-                # Reset all offsets to 0 when no schedule applies
+                # Reset all phases to -1 (disabled) when no schedule applies
                 vtherms = self.find_all_over_switch_vtherms_active()
                 for vt in vtherms:
                     for under in vt.underlyings:
-                        if hasattr(under, 'set_central_stagger_offset'):
-                            under.set_central_stagger_offset(0)
+                        if hasattr(under, 'set_desired_tpi_phase'):
+                            under.set_desired_tpi_phase(-1)
                 return
 
             vtherms = self.find_all_over_switch_vtherms_active()
             vtherm_by_id = {vt.entity_id: vt for vt in vtherms}
 
-            for entity_id, offset_sec in schedule.items():
+            for entity_id, phase_sec in schedule.items():
                 vt = vtherm_by_id.get(entity_id)
                 if vt:
                     for under in vt.underlyings:
-                        if hasattr(under, 'set_central_stagger_offset'):
-                            under.set_central_stagger_offset(offset_sec)
+                        if hasattr(under, 'set_desired_tpi_phase'):
+                            under.set_desired_tpi_phase(phase_sec)
         except Exception as e:
             _LOGGER.error("CentralTpiScheduler: error applying schedule: %s. Heating unaffected.", e)
 

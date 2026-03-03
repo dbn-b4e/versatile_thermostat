@@ -331,7 +331,7 @@ class UnderlyingSwitch(UnderlyingEntity):
             entity_id=switch_entity_id,
         )
         self._initial_delay_sec = initial_delay_sec
-        self._central_stagger_offset = 0
+        self._desired_tpi_phase = -1  # -1 = not scheduled by central scheduler
         self._async_cancel_cycle = None
         self._should_relaunch_control_heating = False
         self._on_time_sec = 0
@@ -357,13 +357,23 @@ class UnderlyingSwitch(UnderlyingEntity):
 
     @property
     def initial_delay_sec(self):
-        """The initial delay for this class, including central stagger offset"""
-        return self._initial_delay_sec + self._central_stagger_offset
+        """The initial delay for this class.
+        If a desired TPI phase is set by central scheduler, compute
+        the wait dynamically from the shared clock so the phase is
+        always correct regardless of when start_cycle is called."""
+        if self._desired_tpi_phase >= 0:
+            cycle_sec = self._on_time_sec + self._off_time_sec
+            if cycle_sec > 0:
+                cycle_pos = int(datetime.now().timestamp()) % cycle_sec
+                wait = (self._desired_tpi_phase - cycle_pos) % cycle_sec
+                return wait
+        return self._initial_delay_sec
 
-    def set_central_stagger_offset(self, offset_sec: int):
-        """Set the central scheduler stagger offset in seconds"""
-        self._central_stagger_offset = offset_sec
-        _LOGGER.debug("%s - Central stagger offset set to %d sec", self, offset_sec)
+    def set_desired_tpi_phase(self, phase: int):
+        """Set the desired absolute phase position (0..cycle_sec-1)
+        within the shared TPI clock. -1 disables central scheduling."""
+        self._desired_tpi_phase = phase
+        _LOGGER.debug("%s - Desired TPI phase set to %d sec", self, phase)
 
     @overrides
     @property
@@ -579,15 +589,15 @@ class UnderlyingSwitch(UnderlyingEntity):
                 _LOGGER.info("%s - 100%% power is requested -> start heating immediatly", self)
                 await self.turn_on()
 
-            # Safety: when force-restarting with a stagger offset, turn OFF the device
+            # Safety: when force-restarting with a phase offset, turn OFF the device
             # to avoid "carry-over" heating during the stagger wait period
-            if force and self.is_device_active and self._central_stagger_offset > 0:
-                _LOGGER.info("%s - Force restart with stagger %ds: turning OFF device to avoid carry-over", self, self._central_stagger_offset)
+            if force and self.is_device_active and self._desired_tpi_phase >= 0 and self.initial_delay_sec > 0:
+                _LOGGER.info("%s - Force restart with phase=%ds, wait=%ds: turning OFF device to avoid carry-over", self, self._desired_tpi_phase, self.initial_delay_sec)
                 await self.turn_off()
 
-            # and starts the cycle with the initial delay (includes central stagger offset)
+            # and starts the cycle with the initial delay (computed from shared clock if phase is set)
             self._async_cancel_cycle = self.call_later(self._hass, self.initial_delay_sec, self._turn_on_later)
-            _LOGGER.debug("%s - Start cycle on_time=%d, initial_delay=%d (stagger=%d))", self, self._on_time_sec, self.initial_delay_sec, self._central_stagger_offset)
+            _LOGGER.debug("%s - Start cycle on_time=%d, initial_delay=%d (phase=%d))", self, self._on_time_sec, self.initial_delay_sec, self._desired_tpi_phase)
         # if we not heat but device is active
         elif self.is_device_active:
             _LOGGER.info("%s - stop heating because device should be off and no cycle is active", self)
@@ -696,22 +706,37 @@ class UnderlyingSwitch(UnderlyingEntity):
             return
 
         action_label = "stop"
-        time = self._off_time_sec
+        off_time = self._off_time_sec
 
-        if time > 0:
+        if off_time > 0:
             _LOGGER.info(
                 "%s - %s heating for %d min %d sec",
                 self,
                 action_label,
-                time // 60,
-                time % 60,
+                off_time // 60,
+                off_time % 60,
             )
             await self.turn_off()
         else:
             _LOGGER.debug("%s - No action on heater cause duration is 0", self)
+
+        # Re-sync with shared clock: compute wait to next ON phase
+        wait_to_next_on = off_time
+        if self._desired_tpi_phase >= 0:
+            cycle_sec = self._on_time_sec + self._off_time_sec
+            if cycle_sec > 0:
+                cycle_pos = int(datetime.now().timestamp()) % cycle_sec
+                wait_to_next_on = (self._desired_tpi_phase - cycle_pos) % cycle_sec
+                if wait_to_next_on < 5:  # avoid immediate re-trigger
+                    wait_to_next_on += cycle_sec
+                _LOGGER.debug(
+                    "%s - Shared clock re-sync: phase=%d, cycle_pos=%d, wait=%d (off_time=%d)",
+                    self, self._desired_tpi_phase, cycle_pos, wait_to_next_on, off_time,
+                )
+
         self._async_cancel_cycle = self.call_later(
             self._hass,
-            time,
+            wait_to_next_on,
             self._turn_on_later,
         )
 
